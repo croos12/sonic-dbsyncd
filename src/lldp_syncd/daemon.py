@@ -377,55 +377,95 @@ class LldpSyncDaemon(SonicSyncDaemon):
         """
         logger.debug("Initiating LLDPd sync to Redis...")
 
-        # push local chassis data to APP DB
         if 'local-chassis' in parsed_update:
             chassis_update = parsed_update.pop('local-chassis')
             if chassis_update != self.chassis_cache:
+                logger.info("Chassis cache update detected")
+                for k, v in chassis_update.items():
+                    old_val = self.chassis_cache.get(k, '<not in cache>')
+                    if k not in self.chassis_cache:
+                        logger.info("Chassis: Adding new key '{}': '{}'".format(k, v))
+                    elif old_val != v:
+                        logger.info("Chassis: Updating key '{}': '{}' -> '{}'".format(k, old_val, v))
+                
+                for k in self.chassis_cache.keys():
+                    if k not in chassis_update:
+                        logger.info("Chassis: Removing key '{}': '{}'".format(k, self.chassis_cache[k]))
+                
                 self.db_connector.delete(self.db_connector.APPL_DB,
                                          LldpSyncDaemon.LLDP_LOC_CHASSIS_TABLE)
                 for k, v in chassis_update.items():
                     self.db_connector.set(self.db_connector.APPL_DB,
                                           LldpSyncDaemon.LLDP_LOC_CHASSIS_TABLE, k, v, blocking=True)
                 logger.debug("sync'd: {}".format(json.dumps(chassis_update, indent=3)))
+                self.chassis_cache = chassis_update
 
         new, changed, deleted = self.cache_diff(self.interfaces_cache, parsed_update)
+        
+        logger.info("Interface cache diff - New: {}, Changed: {}, Deleted: {}".format(new, changed, deleted))
 
         if new or deleted:
-            # If detects any new or deleted interfaces, repopulate for changed interfaces
             for interface in changed:
                 if re.match(SONIC_ETHERNET_RE_PATTERN, interface) is None:
                     logger.warning("Ignoring interface '{}'".format(interface))
                     continue
+                
+                logger.info("Interface '{}' changed - comparing old vs new values:".format(interface))
+                old_data = self.interfaces_cache[interface]
+                new_data = parsed_update[interface]
+                for key in set(old_data.keys()) | set(new_data.keys()):
+                    old_val = old_data.get(key, '<not in old cache>')
+                    new_val = new_data.get(key, '<not in new cache>')
+                    if old_val != new_val:
+                        logger.info("  {}: '{}' -> '{}'".format(key, old_val, new_val))
+                
                 table_key = ':'.join([LldpSyncDaemon.LLDP_ENTRY_TABLE, interface])
                 self.db_connector.delete(self.db_connector.APPL_DB, table_key)
                 self.db_connector.hmset(self.db_connector.APPL_DB, table_key, parsed_update[interface])
                 logger.info("Force repopulate the changed interface {} : {}".format(interface, parsed_update[interface]))
         else:
-            # For changed elements, if only lldp_rem_time_mark changed, update its value, otherwise delete and repopulate
             for interface in changed:
                 if re.match(SONIC_ETHERNET_RE_PATTERN, interface) is None:
                     logger.warning("Ignoring interface '{}'".format(interface))
                     continue
                 table_key = ':'.join([LldpSyncDaemon.LLDP_ENTRY_TABLE, interface])
                 if self.is_only_time_mark_modified(self.interfaces_cache[interface], parsed_update[interface]):
-                    self.db_connector.set(self.db_connector.APPL_DB, table_key, 'lldp_rem_time_mark', parsed_update[interface]['lldp_rem_time_mark'], blocking=True)
-                    logger.debug("Only sync'd interface {} lldp_rem_time_mark: {}".format(interface, parsed_update[interface]['lldp_rem_time_mark']))
+                    old_time_mark = self.interfaces_cache[interface].get('lldp_rem_time_mark', '<not set>')
+                    new_time_mark = parsed_update[interface]['lldp_rem_time_mark']
+                    logger.debug("Only sync'd interface {} lldp_rem_time_mark: {} -> {}".format(
+                        interface, old_time_mark, new_time_mark))
+                    self.db_connector.set(self.db_connector.APPL_DB, table_key, 'lldp_rem_time_mark', new_time_mark, blocking=True)
                 else:
+                    logger.info("Interface '{}' changed - comparing old vs new values:".format(interface))
+                    old_data = self.interfaces_cache[interface]
+                    new_data = parsed_update[interface]
+                    for key in set(old_data.keys()) | set(new_data.keys()):
+                        old_val = old_data.get(key, '<not in old cache>')
+                        new_val = new_data.get(key, '<not in new cache>')
+                        if old_val != new_val:
+                            logger.info("  {}: '{}' -> '{}'".format(key, old_val, new_val))
+                    
                     self.db_connector.delete(self.db_connector.APPL_DB, table_key)
                     self.db_connector.hmset(self.db_connector.APPL_DB, table_key, parsed_update[interface])
                     logger.info("Repopulate for changed interface {} : {}".format(interface, parsed_update[interface]))
-        self.interfaces_cache = parsed_update
-        # Delete LLDP_ENTRIES which are missing
         for interface in deleted:
+            logger.info("Deleting interface '{}' from cache. Old values were:".format(interface))
+            old_data = self.interfaces_cache.get(interface, {})
+            for key, val in old_data.items():
+                logger.info("  {}: '{}'".format(key, val))
             table_key = ':'.join([LldpSyncDaemon.LLDP_ENTRY_TABLE, interface])
             self.db_connector.delete(self.db_connector.APPL_DB, table_key)
             logger.info("Delete table_key: {}".format(table_key))
-        # Repopulate LLDP_ENTRY_TABLE by adding new elements
+        
+        self.interfaces_cache = parsed_update
         for interface in new:
             if re.match(SONIC_ETHERNET_RE_PATTERN, interface) is None:
                 logger.warning("Ignoring interface '{}'".format(interface))
                 continue
-            # port_table_key = LLDP_ENTRY_TABLE:INTERFACE_NAME;
+            logger.info("Adding new interface '{}' to cache with values:".format(interface))
+            new_data = parsed_update[interface]
+            for key, val in new_data.items():
+                logger.info("  {}: '{}'".format(key, val))
             table_key = ':'.join([LldpSyncDaemon.LLDP_ENTRY_TABLE, interface])
             self.db_connector.hmset(self.db_connector.APPL_DB, table_key, parsed_update[interface])
             logger.info("Add new interface {} : {}".format(interface, parsed_update[interface]))
